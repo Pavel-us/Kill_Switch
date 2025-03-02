@@ -1,10 +1,14 @@
 import tkinter as tk
+from tkinter import ttk
 import subprocess
 import threading
 import time
 
-CHECK_INTERVAL = 0.5  # Интервал проверки VPN
-UPDATE_INTERVAL = 0  # Интервал в секундах для автообновления интерфейсов (0 = ручное обновление)
+CHECK_INTERVAL = 0.5  # Интервал проверки
+
+# Глобальная переменная для контроля состояния мониторинга
+monitoring = False
+monitoring_thread = None
 
 # Функция для получения списка всех сетевых интерфейсов
 def get_all_interfaces():
@@ -16,6 +20,28 @@ def get_all_interfaces():
             interfaces.append(interface)
     return interfaces
 
+# Функция для получения списка IP-адресов для интерфейсов
+def get_all_ips():
+    ips = []
+    output = subprocess.check_output("ip -4 addr show", shell=True).decode()
+    for line in output.splitlines():
+        if "inet " in line:
+            ip = line.split()[1].split("/")[0]
+            ips.append(ip)
+    return ips
+
+# Функция для получения локальных IP-адресов и портов через netstat -ntulp
+def get_local_ips_and_ports():
+    local_ips_ports = set()
+    output = subprocess.check_output("netstat -ntulp", shell=True).decode()
+    for line in output.splitlines():
+        if "0.0.0.0" in line or "127.0.0.1" in line:
+            parts = line.split()
+            if len(parts) > 3:
+                ip_port = parts[3]  # Получаем адрес в формате IP:PORT
+                local_ips_ports.add(ip_port)  # Добавляем в множество
+    return list(local_ips_ports)
+
 # Функция для проверки существования интерфейса
 def interface_exists(interface):
     try:
@@ -24,12 +50,13 @@ def interface_exists(interface):
     except subprocess.CalledProcessError:
         return False
 
-# Функция для блокировки всех интерфейсов, если VPN пропал
+# Функция для блокировки всех интерфейсов
 def block_all_internet():
-    print("Блокировка всех интерфейсов. VPN отключен.")
+    print("Блокировка всех интерфейсов.")
     subprocess.run("sudo iptables -P OUTPUT DROP", shell=True)
     subprocess.run("sudo iptables -P FORWARD DROP", shell=True)
-    subprocess.call(['notify-send', 'VPN Disconnect', 'VPN отключен! Доступ в интернет заблокирован.'])
+    subprocess.call(['notify-send', 'VPN Disconnect', 'Интернет заблокирован.'])
+    update_interfaces_and_ips()  # Обновляем интерфейсы и IP-адреса при блокировке
 
 # Функция для снятия всех блокировок
 def unblock_all_internet():
@@ -38,31 +65,59 @@ def unblock_all_internet():
     subprocess.run("sudo iptables -P OUTPUT ACCEPT", shell=True)
     subprocess.run("sudo iptables -F FORWARD", shell=True)
     subprocess.run("sudo iptables -P FORWARD ACCEPT", shell=True)
+    update_interfaces_and_ips()  # Обновляем интерфейсы и IP-адреса при разблокировке
 
-# Функция для мониторинга VPN интерфейса
-def monitor_vpn_interface(vpn_interface):
+# Функция для мониторинга интерфейсов и IP-адресов
+def monitor_vpn_interface(vpn_interface, monitored_ips):
     global monitoring
     while monitoring:
+        # Проверяем, существует ли интерфейс
         if not interface_exists(vpn_interface):
-            print(f"Интерфейс {vpn_interface} пропал. Блокируем интернет.")
+            print(f"Интерфейс {vpn_interface} пропал. Обновляем список.")
             block_all_internet()
-            monitoring = False  # Останавливаем мониторинг без вызова stop_monitoring
+            update_interfaces_and_ips()
+            monitoring = False
             break
+
+        # Проверяем IP-адреса, если отмечены
+        for ip in monitored_ips:
+            current_ips = get_all_ips() + get_local_ips_and_ports()  # Объединяем обычные и локальные IP
+            if ip not in current_ips:
+                print(f"IP {ip} пропал или изменился. Блокировка интернета.")
+                block_all_internet()
+                monitoring = False
+                break
+
         time.sleep(CHECK_INTERVAL)
 
 # Запуск мониторинга VPN интерфейса
 def start_monitoring():
     global monitoring_thread, monitoring
+    if monitoring:
+        # Если мониторинг уже запущен, выводим предупреждение
+        subprocess.call(['notify-send', 'Уведомление', 'Мониторинг уже запущен.'])
+        return
+
     selected_interface = vpn_listbox.get(tk.ACTIVE)
+    selected_ips = [ip_listbox.get(i) for i in ip_listbox.curselection()]  # Отмеченные IP
+
     if selected_interface:
         if interface_exists(selected_interface):
             monitoring = True
             start_button.config(state=tk.DISABLED)
             stop_button.config(state=tk.NORMAL)
+            update_button.config(state=tk.DISABLED)  # Отключаем кнопку обновления во время мониторинга
             vpn_listbox.config(state=tk.DISABLED)
-            monitoring_thread = threading.Thread(target=monitor_vpn_interface, args=(selected_interface,))
+
+            # Уведомление о запуске мониторинга
+            if selected_ips:  # Мониторинг по IP
+                subprocess.call(['notify-send', 'Monitoring', f'Мониторинг IP-адресов {", ".join(selected_ips)} запущен.'])
+            else:  # Мониторинг по интерфейсу
+                subprocess.call(['notify-send', 'Monitoring', f'Мониторинг VPN интерфейса {selected_interface} запущен.'])
+
+            # Запускаем мониторинг в отдельном потоке
+            monitoring_thread = threading.Thread(target=monitor_vpn_interface, args=(selected_interface, selected_ips))
             monitoring_thread.start()
-            subprocess.call(['notify-send', 'Monitoring', f'Мониторинг VPN интерфейса {selected_interface} запущен.'])
 
 # Остановка мониторинга VPN интерфейса
 def stop_monitoring():
@@ -73,74 +128,84 @@ def stop_monitoring():
     unblock_all_internet()
     start_button.config(state=tk.NORMAL)
     stop_button.config(state=tk.DISABLED)
+    update_button.config(state=tk.NORMAL)  # Включаем кнопку обновления после остановки
     vpn_listbox.config(state=tk.NORMAL)
+    update_interfaces_and_ips()  # Обновляем список интерфейсов и IP после остановки
     subprocess.call(['notify-send', 'Stopped', 'Мониторинг VPN интерфейса остановлен, доступ в интернет разблокирован.'])
 
-# Функция для обновления списка VPN интерфейсов
-def update_interfaces():
+# Функция для обновления списка VPN интерфейсов и IP адресов
+def update_interfaces_and_ips():
     vpn_listbox.delete(0, tk.END)  # Очищаем текущий список
+    ip_listbox.delete(0, tk.END)  # Очищаем список IP
+
+    # Обновляем список интерфейсов
     network_interfaces = get_all_interfaces()
     for interface in network_interfaces:
         vpn_listbox.insert(tk.END, interface)
 
-# Функция для автообновления интерфейсов
-def auto_update_interfaces():
-    if UPDATE_INTERVAL > 0:
-        update_interfaces()
-        root.after(UPDATE_INTERVAL * 1000, auto_update_interfaces)  # Обновляем интерфейсы каждые N секунд
+    # Обновляем список IP-адресов (обычные + локальные)
+    ip_addresses = get_all_ips() + get_local_ips_and_ports()
+    for ip in ip_addresses:
+        ip_listbox.insert(tk.END, ip)
 
-# Функция для обновления состояния кнопок
-def update_buttons_state(event):
-    if vpn_listbox.curselection():  # Если выбран интерфейс
-        start_button.config(state=tk.NORMAL)
+# Функция для завершения работы программы
+def on_closing():
+    global monitoring
+    if monitoring:
+        # Остановить мониторинг и разблокировать интернет перед закрытием
+        stop_monitoring()
     else:
-        start_button.config(state=tk.DISABLED)
+        # Если мониторинг не запущен, просто снимаем блокировки
+        unblock_all_internet()
+    root.destroy()  # Закрывает окно и завершает работу программы
 
 # Главное окно
 root = tk.Tk()
 root.title("VPN Kill Switch")
 root.configure(bg="#2E2E2E")  # Темный фон
+root.geometry("290x420")  # Возвращаем стандартный размер окна
+root.minsize(290, 420)  # Минимальный размер окна
+
+# Устанавливаем обработчик для закрытия окна
+root.protocol("WM_DELETE_WINDOW", on_closing)
 
 # Настройка темной темы
-root.tk_setPalette(background="#2E2E2E", foreground="#FFFFFF", activeBackground="#4B4B4B", activeForeground="#FFFFFF")
+style = ttk.Style()
+style.configure("TLabel", background="#2E2E2E", foreground="#FFFFFF")
+style.configure("TCheckbutton", background="#2E2E2E", foreground="#FFFFFF")
+style.configure("TButton", background="#3A3A3A", foreground="#FFFFFF")
+style.configure("TFrame", background="#2E2E2E")
+style.configure("TListbox", background="#3A3A3A", foreground="#FFFFFF")
+style.configure("TListbox.Highlight", background="#FFFFFF", foreground="#000000")  # Белое выделение
 
-vpn_label = tk.Label(root, text="Доступные сетевые интерфейсы", bg="#2E2E2E", fg="#FFFFFF")
-vpn_label.pack(pady=10)
+vpn_label = ttk.Label(root, text="Доступные сетевые интерфейсы")
+vpn_label.pack(pady=5)
 
 # Список доступных сетевых интерфейсов
-vpn_listbox = tk.Listbox(root, height=10, bg="#3A3A3A", fg="#FFFFFF", selectbackground="#4B4B4B", selectforeground="#FFFFFF")
-vpn_listbox.pack()
-vpn_listbox.bind("<<ListboxSelect>>", update_buttons_state)
+vpn_listbox = tk.Listbox(root, height=5, bg="#3A3A3A", fg="#FFFFFF", selectbackground="#FFFFFF", selectforeground="#000000")
+vpn_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-# Кнопка обновления, если автообновление отключено
-if UPDATE_INTERVAL == 0:
-    update_button = tk.Button(root, text="Обновить", command=update_interfaces, bg="#3A3A3A", fg="#FFFFFF", activebackground="#4B4B4B", activeforeground="#FFFFFF")
-    update_button.pack(pady=10)
+# Список IP адресов (обычные + локальные)
+ip_label = ttk.Label(root, text="Доступные IP адреса")
+ip_label.pack(pady=5)
 
-# Кнопки для запуска и остановки мониторинга
-button_frame = tk.Frame(root, bg="#2E2E2E")
+ip_listbox = tk.Listbox(root, height=5, bg="#3A3A3A", fg="#FFFFFF", selectbackground="#FFFFFF", selectforeground="#000000", selectmode=tk.MULTIPLE)
+ip_listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+# Панель для кнопок "Запустить", "Обновить", "Остановить"
+button_frame = ttk.Frame(root)
 button_frame.pack(pady=10)
 
-start_button = tk.Button(button_frame, text="Запустить", command=start_monitoring, state=tk.DISABLED, bg="#3A3A3A", fg="#FFFFFF", activebackground="#4B4B4B", activeforeground="#FFFFFF")
-start_button.grid(row=0, column=0, padx=5)
+start_button = ttk.Button(button_frame, text="Запустить", command=start_monitoring)
+start_button.pack(side=tk.LEFT, padx=10)
 
-stop_button = tk.Button(button_frame, text="Остановить", command=stop_monitoring, state=tk.DISABLED, bg="#3A3A3A", fg="#FFFFFF", activebackground="#4B4B4B", activeforeground="#FFFFFF")
-stop_button.grid(row=0, column=1, padx=5)
+update_button = ttk.Button(button_frame, text="Обновить", command=update_interfaces_and_ips)
+update_button.pack(side=tk.LEFT, padx=10)
 
-monitoring = False
-monitoring_thread = None
+stop_button = ttk.Button(button_frame, text="Остановить", command=stop_monitoring, state=tk.DISABLED)
+stop_button.pack(side=tk.LEFT, padx=10)
 
-# Автоматическое обновление списка интерфейсов при запуске, если не задано ручное обновление
-if UPDATE_INTERVAL > 0:
-    auto_update_interfaces()
-else:
-    update_interfaces()
-
-# При закрытии программы разблокируем все интерфейсы
-def on_closing():
-    stop_monitoring()  # Останавливаем мониторинг и разблокируем интернет
-    root.destroy()
-
-root.protocol("WM_DELETE_WINDOW", on_closing)
+# Начальная настройка и запуск
+update_interfaces_and_ips()
 
 root.mainloop()
